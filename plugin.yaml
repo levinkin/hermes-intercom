@@ -5,3 +5,7 @@ author: "majordave"
 kind: standalone
 provides_tools:
   - intercom
+provides_hooks:
+  - pre_llm_call
+  - on_session_end
+  - on_session_finalize
