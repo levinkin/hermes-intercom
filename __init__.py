@@ -56,11 +56,6 @@ _SCHEMA = {
 }
 
 
-def _check(_args=None) -> bool:
-    """Service gate: only expose the tool when the inbox config allows it."""
-    return True
-
-
 def _strip_echo_headers(message: str) -> str:
     """Drop lines the sending LLM echoed from a received frame.
 
@@ -77,6 +72,8 @@ def _strip_echo_headers(message: str) -> str:
 
 
 def _handle(args: dict, **kw) -> str:
+    if not inbox.self_meta():
+        return json.dumps({"ok": False, "error": "intercom is only available to local cli, tui and desktop sessions"})
     action = args.get("action", "")
     if action == "list":
         peers, me = inbox.list_peers()
@@ -135,24 +132,23 @@ def _handle(args: dict, **kw) -> str:
 
 
 def _on_pre_llm_call(**kw) -> dict:
-    """Mark turn active + drain messages parked while idle into the turn."""
-    try:
-        inbox.set_turn_active(True)
-        pending = inbox.take_pending()
-    except Exception:
-        return {}
-    if not pending:
-        return {"context": ""}
-    body = "\n\n".join(pending)
-    return {"context": f"[Messages delivered from other sessions while you were idle]\n\n{body}"}
+    from . import desktop
+
+    desktop.refresh(active=True)
+    return {}
 
 
 def _on_session_end(**kw) -> None:
     """Turn finished — publish idle state."""
-    try:
-        inbox.set_turn_active(False)
-    except Exception:
-        pass
+    from . import desktop
+
+    desktop.refresh(active=False)
+
+
+def _on_session_finalize(**kw) -> None:
+    from . import desktop
+
+    desktop.refresh()
 
 
 def register(ctx) -> None:
@@ -164,15 +160,17 @@ def register(ctx) -> None:
         toolset="intercom",
         schema=_SCHEMA,
         handler=_handle,
-        check_fn=_check,
         description="Message other live Hermes sessions on this machine.",
         emoji="📡",
     )
 
     if inbox_enabled:
         try:
-            inbox.start()
+            from . import desktop
+
+            desktop.start(ctx)
             ctx.register_hook("pre_llm_call", _on_pre_llm_call)
             ctx.register_hook("on_session_end", _on_session_end)
+            ctx.register_hook("on_session_finalize", _on_session_finalize)
         except Exception as exc:
             logger.warning("intercom inbox failed to start: %s", exc)

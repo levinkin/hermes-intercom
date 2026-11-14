@@ -1,28 +1,30 @@
 """intercom inbox — per-session UDS server + peer registry.
 
-Each opted-in interactive CLI session:
-- writes ~/.hermes/intercom/sessions/<session_id>.json  {name, pid, cwd, session_id, socket, started_at}
-- binds    ~/.hermes/intercom/sessions/<session_id>.sock (0600) served on a daemon thread
-- removes both at exit (atexit)
+Each gateway publishes its interactive local sessions in the peer registry.
+Cross-process traffic uses an owner-only Unix socket; same-process delivery is direct.
 
-Envelope protocol (JSON lines over the socket):
+Envelope protocol (length-prefixed AES-GCM-sealed JSON over the socket):
   -> {"type": "send", "from_name": ..., "from_cwd": ..., "message": ...}
   <- {"ok": true} | {"ok": false, "error": ...}
 
 Delivery on the receiving side:
-  busy  -> agent.steer(wrapped_text)
-  idle  -> pending queue; drained at next turn start by the tool's turn hook
+  gateway -> authenticated local-session injection
 """
 
 from __future__ import annotations
 
-import atexit
+import math
+import stat
 import json
 import logging
 import os
 import socket
 import struct
-import sys
+import re
+from collections import OrderedDict
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import threading
 import time
 import uuid
@@ -33,69 +35,19 @@ logger = logging.getLogger(__name__)
 _DIR_NAME = "intercom"
 _REGISTRY = "sessions"
 _MAX_MSG_CHARS = 8000
-_PENDING_CAP = 10
 _RATE_WINDOW_S = 60
 _RATE_MAX_PER_PEER = 6
 _DEDUPE_WINDOW_S = 120
 
-_lock = threading.Lock()
+_lock = threading.RLock()
+_sending = set()
+_MAX_WIRE_BYTES = _MAX_MSG_CHARS * 16 + 8192
+_NONCE_CAP = 16384
+_nonces = OrderedDict()
+_ACCEPTED = frozenset(("submitted_as_turn", "reply_resolved"))
 _state: dict = {}          # session-scoped singleton state
-_pending_by_peer: dict[str, list[dict]] = {}   # peer_name -> [envelopes]
-_rate: dict[str, list[float]] = {}             # peer_name -> timestamps
-_dedupe: dict[str, list[tuple[int, float]]] = {}  # peer_name -> [(hash, ts)]
-
-
-def _human_view(header: str, body: str) -> str:
-    """Reasoning-style box: top/bottom rules with side corners, no side rails.
-
-    The title line never exceeds the box width: if the header is long the
-    dashes shrink to the minimum and the ┐ corner still lands at column W.
-    """
-    import shutil
-
-    # Full terminal width (minus 1 col so the ┐/┘ corners don't trigger
-    # a wrap on terminals that auto-wrap at exactly cols).
-    term_w = shutil.get_terminal_size((100, 20)).columns
-    w = max(40, term_w - 1)
-    def dlen(s: str) -> int:
-        """Display width: emoji/CJK count 2 columns."""
-        return len(s) + sum(1 for ch in s if ord(ch) > 0x1F000)
-
-    top_label = f"┌─ 📡 INTERCOM · {header} "
-    top_dlen = dlen(top_label)
-    if top_dlen + 2 <= w:
-        out = [top_label + "─" * (w - top_dlen - 1) + "┐"]
-    else:
-        # header too long: truncate it so the corner still fits on row 1
-        keep = max(10, w - 4 - (dlen(top_label) - len(top_label)))
-        out = [top_label[:keep] + "…┐"]
-    import textwrap
-
-    for l in body.split("\n"):
-        if not l:
-            out.append("")
-            continue
-        out.extend(textwrap.wrap(l, width=w, replace_whitespace=False,
-                                 drop_whitespace=False) or [""])
-    out.append("└" + "─" * (w - 2) + "┘")
-    return "\n".join(out)
-
-
-def _display_banner(human_text: str) -> None:
-    """Print an incoming message straight onto the session's screen.
-
-    Shows only the compact human view; the full model wrapper is NOT
-    printed here (it enters context via steer/pending drain), so the
-    user sees the message once, not twice.
-    """
-    try:
-        out = sys.stdout
-        if out is None:
-            return
-        out.write("\n" + human_text + "\n\n")
-        out.flush()
-    except Exception:
-        pass  # never crash delivery on a render problem
+_rate: dict[tuple[str, str], list[float]] = {}
+_dedupe: dict[tuple[str, str], list[tuple[int, float]]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -111,59 +63,17 @@ def _registry_dir() -> Path:
     return _base_dir() / _REGISTRY
 
 
-def _default_name() -> str:
-    """Stable per-profile name with a live-session suffix.
-
-    Profile identity comes from the HERMES_HOME path (…/profiles/<name>/
-    vs the default home), so two sessions of the same profile share a base
-    name and disambiguate by pid — mirroring Walkie Talkie's
-    agent_id + session_id split, simplified.
-    """
-    from hermes_constants import get_hermes_home
-
-    home = Path(get_hermes_home())
-    profile = home.name if home.parent.name == "profiles" else "default"
-    cwd = Path.cwd().name or "session"
-    return f"{profile}-{cwd[:20]}-{os.getpid() % 1000:03d}"
-
-
-def sweep_stale() -> list[str]:
-    """Remove registry entries whose PID is dead. Returns surviving names."""
-    alive: dict[str, dict] = {}
-    for path in sorted(_registry_dir().glob("*.json")):
-        try:
-            meta = json.loads(path.read_text())
-            os.kill(int(meta["pid"]), 0)
-            alive[meta["name"]] = meta
-        except (OSError, ValueError, KeyError):
-            try:
-                meta0 = json.loads(path.read_text())
-            except Exception:
-                meta0 = {}
-            sock = meta0.get("socket", "")
-            if sock and os.path.exists(sock):
-                os.unlink(sock)
-            path.unlink(missing_ok=True)
-    return sorted(alive.keys())
-
-
-# ---------------------------------------------------------------------------
-# delivery
-# ---------------------------------------------------------------------------
-
 def _sanitize_boundary(text: str) -> str:
     """Neutralise boundary-marker injection in untrusted message parts.
 
-    Sender names and message bodies travel inside the INTERCOM wrapper; a
-    malicious peer could embed ``[/INTERCOM MESSAGE]`` to break out of the
-    frame and have the trailing text read as ordinary context (upstream
-    analog: Walkie Talkie SEC-R2). Insert zero-width spaces into any
-    boundary-like tag so it no longer parses as one.
+    A malicious peer could put a forged ``📡 hermes@... says:`` header line in
+    its body to pose as another sender. Insert a zero-width space after the
+    emoji so only the real first line parses as the header.
     """
     # Header forgery: a body line mimicking our new header format gets broken
     # by a zero-width space right after the emoji, so only the true first
     # line (added by _wrap) parses as the header.
-    text = text.replace("📡 INTERCOM", "📡\u200b INTERCOM")
+    text = re.sub(r"📡(?=\s*hermes@[^\n]*says:)", "📡\u200b", text)
     return text
 
 
@@ -173,263 +83,86 @@ def _sanitize_name(name: str) -> str:
     return cleaned.strip() or "unknown"
 
 
-def _frame_parts(from_name: str, from_cwd: str, message: str) -> tuple[str, str]:
+def _frame_parts(from_name: str, message: str) -> tuple[str, str]:
     """Return (header_line, sanitized_body)."""
-    from_name = _sanitize_name(from_name)
     body = _sanitize_boundary(str(message))
     header = f"📡 hermes@{from_name} says:"
     return header, body
 
 
-def _wrap(from_name: str, from_cwd: str, message: str) -> str:
-    """Full model-facing frame: identity header + body."""
-    header, body = _frame_parts(from_name, from_cwd, message)
-    return f"{header}\n{body}"
-
-
-def _agent_busy(agent) -> bool:
-    """Heuristic: agent is mid-turn when a conversation loop flag is set."""
-    for attr in ("_is_processing", "_busy", "_in_turn"):
-        v = getattr(agent, attr, None)
-        if isinstance(v, bool):
-            return v
-    # Fallback: steer() returns False only on empty text; there is no public
-    # busy probe, so treat "steer accepted" as authoritative — see deliver().
-    return True
-
-
-def _find_cli_instance(cli_mod):
-    """Locate the running HermesCLI instance.
-
-    ``cli`` is a local in ``main()`` (cli.py:21256), not module state, so we
-    find the live object via GC — there is exactly one per interactive
-    session process.
-    """
-    import gc
-
-    for o in gc.get_objects():
-        if type(o).__name__ == "HermesCLI" and hasattr(o, "_pending_input"):
-            return o
-    return None
-
-
-def _deliver_local(text: str, *, display: bool = False) -> str:
-    import cli as cli_mod
-
-    cli_obj = getattr(cli_mod, "_cli_instance", None) or _find_cli_instance(cli_mod)
-
-    agent = getattr(cli_mod, "_active_agent_ref", None)
-    if agent is None and cli_obj is not None:
-        agent = getattr(cli_obj, "agent", None)
-
-    # Wake-the-input-loop path: the interactive CLI drains `_pending_input`
-    # in its process_loop thread (0.1s poll). Putting the message there makes
-    # the receiving session START A TURN automatically — Claude Code parity.
-    pq = getattr(cli_obj, "_pending_input", None) if cli_obj is not None else None
-    proc_busy = bool(getattr(cli_obj, "_agent_running", False)) or _is_turn_running(agent)
-    reg_busy = self_registry_turn_active()
-    if pq is not None and not proc_busy and not reg_busy:
-        try:
-            pq.put(text)
-            return "submitted_as_turn"
-        except Exception:
-            pass
-
-    if agent is None:
-        # No reachable agent in THIS process (e.g. the peer is a TUI/desktop
-        # session whose agent lives in tui_gateway.entry). Park the message
-        # anyway — the plugin's pre_llm_call hook drains it into the next
-        # turn of whichever process received it.
-        spill = False
-        with _lock:
-            pend = _state.setdefault("pending_for_self", [])
-            if len(pend) >= _PENDING_CAP:
-                spill = True
-                status = "held_spilled"
-            else:
-                pend.append(text)
-                spill = True
-                status = "parked_no_agent"
-        if spill:
-            _spool_append(text)   # outside the lock — self_meta() takes it
-        return status
-
-    # Busy path: steer drains between tool calls of the running turn.
-    # Registry says busy even when process-local probes lag — steer anyway.
-    if _is_turn_running(agent) or reg_busy:
-        if hasattr(agent, "steer") and agent.steer(text):
-            return "steered"
-        return "held_steer_rejected"
-    # Idle path: park it; the next user prompt sees it via take_pending().
-    with _lock:
-        pend = _state.setdefault("pending_for_self", [])
-        if len(pend) >= _PENDING_CAP:
-            return "rejected_pending_cap"
-        pend.append(text)
-    return "parked_idle"
-
-
-def _is_turn_running(agent) -> bool:
-    """Best-effort detection that the agent loop is between API calls.
-
-    Hermes sets `_conversation_active`/`_processing` in different versions;
-    we probe the known flags and default to False (idle → parked), which is
-    the safe choice: a steered message into an idle session would otherwise
-    surface mid-next-turn unexpectedly.
-    """
-    for attr in (
-        "_conversation_active",
-        "_is_conversation_active",
-        "_processing",
-        "_turn_running",
-    ):
-        v = getattr(agent, attr, None)
-        if v is True:
-            return True
-    # The CLI sets this while run_conversation executes.
-    cb = getattr(agent, "_tool_start_callback", None)
-    return bool(getattr(agent, "_current_tool_count", None))
-
-
-def set_turn_active(active: bool) -> None:
-    """Publish this session's busy/idle state into its registry entry.
-
-    Written by the pre_llm_call hook (turn starts) and a post-turn hook so
-    senders (and humans) can see who is mid-turn before messaging.
-    """
-    try:
-        with _lock:
-            meta = dict(_state.get("meta") or {})
-        if not meta:
-            return
-        path = _registry_dir() / f"{meta.get('session_id')}.json"
-        if not path.exists():
-            return
-        data = json.loads(path.read_text())
-        data["turn_active"] = bool(active)
-        data["turn_ts"] = time.time()
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data))
-        tmp.replace(path)
-    except Exception:
-        pass  # never break a turn over registry bookkeeping
-
-
 def list_peers() -> tuple[list[dict], dict]:
     """Live peers with busy state + self meta. For the tool's action=list."""
+    from . import desktop
+
+    desktop.refresh()
     me = self_meta()
-    out = []
-    for name, meta in _load_peers().items():
-        if name == me.get("name"):
+    peers = []
+    for identifier, metadata in _load_peers().items():
+        if identifier == me.get("session_id"):
             continue
-        out.append({
-            "name": name,
-            "cwd": meta.get("cwd"),
-            "busy": bool(meta.get("turn_active")),
-        })
-    return out, me
-
-
-def self_registry_turn_active() -> bool:
-    """Read this session's own published turn_active flag (registry JSON)."""
-    try:
-        with _lock:
-            sid = (_state.get("meta") or {}).get("session_id")
-        if not sid:
-            return False
-        p = _registry_dir() / f"{sid}.json"
-        return bool(json.loads(p.read_text()).get("turn_active"))
-    except Exception:
-        return False
+        peers.append({"name": metadata["name"],
+                      "session_id": identifier, "cwd": metadata.get("cwd"),
+                      "busy": bool(metadata.get("turn_active"))})
+    return peers, me
 
 
 def _load_peers() -> dict:
-    """Read live peer metadata from the registry, keyed by name."""
+    """Read live peer metadata from the registry, keyed by endpoint id."""
     peers = {}
     for path in sorted(_registry_dir().glob("*.json")):
         try:
-            meta = json.loads(path.read_text())
-            os.kill(int(meta["pid"]), 0)  # skip dead entries without sweeping
-            peers.setdefault(meta["name"], meta)
-        except Exception:
-            continue
+            metadata = json.loads(path.read_text())
+            if not isinstance(metadata["name"], str) or not metadata["name"]:
+                raise ValueError("invalid peer name")
+            os.kill(int(metadata["pid"]), 0)
+            if metadata["session_id"] != path.stem:
+                raise ValueError("registry endpoint mismatch")
+            peers[path.stem] = metadata
+        except (OSError, ValueError, KeyError, TypeError):
+            path.unlink(missing_ok=True)
     return peers
 
 
-def _reply_waiter_socket(request_id: str) -> str:
-    """Bind a one-shot reply socket for this process, keyed by request_id."""
-    reg = _registry_dir()
-    path = str(reg / f"reply-{request_id}.sock")
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
-    return path
-
-
-def ask_to(
-    target: str,
-    message: str,
-    from_name: str = "",
-    from_cwd: str = "",
-    timeout: int = 600,
-) -> dict:
+def ask_to(target: str, message: str, from_name: str = "", from_cwd: str = "",
+           timeout: int = 600) -> dict:
     """Send `message` to peer and block until their reply or timeout.
 
     The reply arrives on our own inbox as type='reply' addressed to
     request_id; the inbox thread hands it to the waiter event.
     """
-    resolved_target = resolve_target(target)
-    if not resolved_target.get("ok"):
-        return {**resolved_target, "action": "ask"}
-    expected_peer = _sanitize_name(resolved_target["name"])
+    resolved = resolve_target(target)
+    if not resolved.get("ok"):
+        return {**resolved, "action": "ask"}
     request_id = uuid.uuid4().hex
-    evt = threading.Event()
+    event = threading.Event()
+    waiter = {"evt": event, "reply": None,
+              "expected_peer": resolved["meta"]["session_id"]}
     with _lock:
-        _state.setdefault("waiters", {})[request_id] = {
-            "evt": evt,
-            "reply": None,
-            "expected_peer": expected_peer,
-        }
-
-    payload_extra = {
-        "type": "ask",
-        "request_id": request_id,
-        "ask_timeout": timeout,
-    }
-    res = send_to(
-        resolved_target["name"],
-        message,
-        from_name,
-        from_cwd,
-        payload_extra=payload_extra,
-    )
-    if not res.get("ok"):
+        _state.setdefault("waiters", {})[request_id] = waiter
+    try:
+        result = send_to(resolved["name"], message, from_name, from_cwd,
+                         payload_extra={"type": "ask", "request_id": request_id,
+                                        "_resolved_target": resolved})
+        if not result.get("ok"):
+            return {**result, "action": "ask"}
+        if not event.wait(timeout=max(0, min(timeout, 3600))):
+            return {"ok": False, "error": "timeout waiting for reply",
+                    "request_id": request_id, "action": "ask"}
+        reply = waiter["reply"]
+        return {"ok": reply is not None, "reply": reply, "from": target, "action": "ask"}
+    finally:
         with _lock:
             _state.get("waiters", {}).pop(request_id, None)
-        return {**res, "action": "ask"}
-
-    # Ask accepted: wait for the peer's reply envelope on our inbox.
-    if not evt.wait(timeout=min(timeout, 3600)):
-        with _lock:
-            _state.get("waiters", {}).pop(request_id, None)
-        return {"ok": False, "error": "timeout waiting for reply",
-                "request_id": request_id, "action": "ask"}
-    with _lock:
-        entry = _state.get("waiters", {}).pop(request_id, None)
-    reply = (entry or {}).get("reply")
-    return {"ok": reply is not None, "reply": reply,
-            "from": target, "action": "ask"}
 
 
-def resolve_ask(request_id: str, from_name: str, reply_text: str) -> bool:
+def resolve_ask(request_id: str, sender: str, reply_text: str) -> bool:
     """Deliver a reply for a pending ask. True if a local waiter took it."""
     with _lock:
-        w = _state.get("waiters", {}).get(request_id)
-        if w is None or w.get("expected_peer") != from_name:
+        waiter = _state.get("waiters", {}).get(request_id)
+        if waiter is None or waiter.get("expected_peer") != sender or waiter["evt"].is_set():
             return False
-        w["reply"] = reply_text
-    w["evt"].set()
+        waiter["reply"] = reply_text[:_MAX_MSG_CHARS]
+        waiter["evt"].set()
     return True
 
 
@@ -454,88 +187,94 @@ def reply_to(
 def resolve_target(target: str) -> dict:
     """Resolve a unique live peer name from an exact name or prefix."""
     peers = _load_peers()
-    if target in peers:
-        return {"ok": True, "name": target, "meta": peers[target]}
-    matches = [name for name in peers if name == target or name.startswith(target)]
+    exact = [(identifier, metadata) for identifier, metadata in peers.items()
+             if metadata["name"] == target or identifier == target]
+    matches = exact or [(identifier, metadata) for identifier, metadata in peers.items()
+                        if metadata["name"].startswith(target)]
     if not matches:
-        sweep_stale()
-        return {
-            "ok": False,
-            "error": f"no live peer named '{target}'",
-            "peers": sweep_stale(),
-        }
+        return {"ok": False, "error": f"no live peer named '{target}'",
+                "peers": sorted(metadata["name"] for metadata in peers.values())}
     if len(matches) > 1:
-        return {"ok": False, "error": f"ambiguous name; matches: {matches}"}
-    return {"ok": True, "name": matches[0], "meta": peers[matches[0]]}
+        return {"ok": False, "error": "ambiguous name", "candidates": [
+            {"name": metadata["name"], "session_id": identifier}
+            for identifier, metadata in matches]}
+    _, metadata = matches[0]
+    return {"ok": True, "name": metadata["name"], "meta": metadata}
 
 
 def _exchange(meta: dict, payload: dict) -> dict:
     """Exchange one authenticated-local envelope with a registered peer."""
+    from . import desktop
+
+    sender = self_meta().get("session_id", "")
+    local = desktop._metadata.get(meta.get("session_key"))
+    if local is not None and local["session_id"] == meta["session_id"]:
+        return _receive({**payload, "session_key": meta["session_key"]}, sender)
+    destination = meta["session_id"]
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(5)
-            connection.connect(meta["socket"])
-            connection.sendall((json.dumps(payload) + "\n").encode())
-            data = b""
-            while b"\n" not in data:
-                chunk = connection.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-        return json.loads(data.decode().strip() or "{}")
-    except (OSError, json.JSONDecodeError) as exc:
-        return {"ok": False, "error": f"delivery failed: {exc}"}
+            try:
+                connection.connect(meta["socket"])
+            except OSError:
+                _drop_peer(meta)
+                raise
+            if _peer_uid(connection) != os.getuid():
+                raise PermissionError("server uid mismatch")
+            _send_frame(connection, _seal({**payload, "session_key": meta.get("session_key", "")}, sender, destination))
+            envelope = _read_frame(connection)
+            if envelope["sender"] != destination:
+                raise ValueError("receipt sender mismatch")
+            reply = _open(envelope, destination=sender)
+            if envelope["type"] != "receipt" or envelope["request_id"] != payload.get("request_id", ""):
+                raise ValueError("receipt correlation mismatch")
+            return reply
+    except (OSError, ValueError, KeyError, TypeError, EOFError, InvalidTag) as exception:
+        return {"ok": False, "error": f"delivery failed: {exception}"}
 
 
 def send_to(target: str, message: str, from_name: str = "", from_cwd: str = "",
             payload_extra: dict | None = None, *, dedupe: bool = True) -> dict:
     """Send `message` to peer `target`. Returns status dict."""
-    resolved_target = resolve_target(target)
-    if not resolved_target.get("ok"):
-        return resolved_target
-    name = resolved_target["name"]
-    meta = resolved_target["meta"]
-    if int(meta.get("pid", -1)) == os.getpid():
+    extra = dict(payload_extra or {})
+    resolved = extra.pop("_resolved_target", None) or resolve_target(target)
+    if not resolved.get("ok"):
+        return resolved
+    name, metadata = resolved["name"], resolved["meta"]
+    me = self_meta()
+    if (metadata.get("session_key") and metadata["session_key"] == me.get("session_key")) or (
+        not metadata.get("session_key") and int(metadata.get("pid", -1)) == os.getpid()
+    ):
         return {"ok": False, "error": "target is the current session"}
-
-    now = time.time()
+    payload = {"type": "send", "from_name": from_name, "from_cwd": from_cwd,
+               "message": message[:_MAX_MSG_CHARS], **extra}
+    if payload["type"] in ("ask", "reply") and not re.fullmatch(r"[0-9a-f]{32}", str(payload.get("request_id", ""))):
+        return {"ok": False, "error": "invalid request id"}
+    peer = (me.get("session_id", ""), metadata.get("session_id", name))
+    digest = payload.get("request_id") if payload["type"] == "ask" else hash(payload["message"])
     with _lock:
-        window = [t for t in _rate.get(name, []) if now - t < _RATE_WINDOW_S]
-        if len(window) >= _RATE_MAX_PER_PEER:
+        _prune_windows(time.time())
+        if peer in _sending:
+            return {"ok": False, "error": "delivery already in progress for this peer"}
+        if len(_rate.get(peer, [])) >= _RATE_MAX_PER_PEER:
             return {"ok": False, "error": "rate limit reached for this peer"}
-        window.append(now)
-        _rate[name] = window
-        if dedupe:
-            seen = [(h, t) for h, t in _dedupe.get(name, []) if now - t < _DEDUPE_WINDOW_S]
-            digest = hash(message)
-            if any(h == digest for h, _ in seen):
-                return {"ok": False, "error": "identical message already sent recently"}
-            seen.append((digest, now))
-            _dedupe[name] = seen
-
-    payload = {
-        "type": "send",
-        "from_name": from_name,
-        "from_cwd": from_cwd,
-        "message": message[:_MAX_MSG_CHARS],
-        **(payload_extra or {}),
-    }
-    reply = _exchange(meta, payload)
-    if not reply.get("ok") and reply.get("error"):
-        return {**reply, "receipt": "refused", "to": name}
-
-    # Normalize receipt (Walkie Talkie-style taxonomy).
-    status = reply.get("status")
-    if status in ("submitted_as_turn",):
-        receipt = "delivered"       # receiver will start a turn
-    elif status in ("steered", "parked_idle", "parked_no_agent"):
-        receipt = "held"            # accepted, surfaces at next boundary/turn
-    elif status == "reply_resolved":
-        receipt = "delivered"
-    else:
-        receipt = "refused"
-    return {"ok": reply.get("ok", False), "receipt": receipt,
-            "delivered_as": status, "to": name}
+        if dedupe and any(value == digest for value, timestamp in _dedupe.get(peer, [])):
+            return {"ok": False, "error": "identical message already sent recently"}
+        _sending.add(peer)
+    try:
+        reply = _exchange(metadata, payload)
+        status = reply.get("status")
+        accepted = reply.get("ok") is True and status in _ACCEPTED
+        if not accepted:
+            return {**reply, "ok": False, "receipt": "refused", "to": name}
+        with _lock:
+            _rate.setdefault(peer, []).append(time.time())
+            if dedupe:
+                _dedupe.setdefault(peer, []).append((digest, time.time()))
+    finally:
+        with _lock:
+            _sending.discard(peer)
+    return {"ok": True, "receipt": "delivered", "delivered_as": status, "to": name}
 
 
 # ---------------------------------------------------------------------------
@@ -560,192 +299,215 @@ def _peer_uid(conn: socket.socket) -> int:
         return int(uid)
     raise PermissionError("peer uid authentication is unavailable on this platform")
 
+
+def _receive(request: dict, sender: str) -> dict:
+    request_type = request["type"]
+    if request_type not in ("send", "ask", "reply"):
+        raise ValueError("unsupported envelope type")
+    message = str(request.get("message", ""))[:_MAX_MSG_CHARS]
+    if request_type == "reply":
+        accepted = resolve_ask(request["request_id"], sender, message)
+        response = {"ok": accepted, "status": "reply_resolved" if accepted else "no_pending_ask"}
+    else:
+        name = _sanitize_name(request.get("from_name") or "unknown")
+        header, body = _frame_parts(name, message)
+        text = f"{header}\n{body}"
+        if request_type == "ask":
+            text += (f'\n[The sender expects a reply. Use intercom(action="reply", '
+                     f'to={json.dumps(name, ensure_ascii=False)}, request_id="{request["request_id"]}", message="...").]')
+        from . import desktop
+
+        status = desktop.deliver(request.get("session_key"), text)
+        response = {"ok": status in _ACCEPTED, "status": status}
+    return response
+
+
 def _serve(conn: socket.socket) -> None:
     try:
-        peer_uid = _peer_uid(conn)
-        if peer_uid != os.getuid():
-            raise PermissionError(
-                f"peer uid {peer_uid} does not match server uid {os.getuid()}"
-            )
-        data = b""
         conn.settimeout(10)
-        while b"\n" not in data:
-            chunk = conn.recv(65536)
-            if not chunk:
-                break
-            data += chunk
-            if len(data) > _MAX_MSG_CHARS * 4:
-                break
-        line = data.split(b"\n", 1)[0].decode(errors="replace").strip()
-        req = json.loads(line) if line else {}
-        req_type = req.get("type", "send")
-        if req_type not in ("send", "ask", "reply"):
-            raise ValueError(f"unsupported type {req_type!r}")
-        if req_type == "reply":
-            # Reply to one of OUR asks: hand it to the local waiter.
-            ok = resolve_ask(
-                str(req.get("request_id", "")),
-                _sanitize_name(req.get("from_name") or "unknown"),
-                str(req.get("message", "")),
-            )
-            resp = {"ok": ok, "status": "reply_resolved" if ok else "no_pending_ask"}
-            conn.sendall((json.dumps(resp) + "\n").encode())
-            conn.close()
-            return
-        sender = _sanitize_name(req.get("from_name") or "unknown")
-        header, body = _frame_parts(sender, req.get("from_cwd") or "?",
-                                    str(req.get("message", ""))[:_MAX_MSG_CHARS])
-        text = f"{header}\n{body}"
-        if req_type == "ask" and req.get("request_id"):
-            # Tell the receiving agent this needs a reply, and how.
-            rid = str(req["request_id"])
-            asker = _sanitize_name(req.get("from_name") or "unknown")
-            text = (
-                f"{text}\n"
-                f"[The sender expects a reply. Use intercom(action=\"reply\", "
-                f"to=\"{asker}\", request_id=\"{rid}\", message=\"...\").]"
-            )
-        status = _deliver_local(text)
-        resp = {"ok": status not in ("rejected_pending_cap",), "status": status}
-    except Exception as exc:  # never crash the thread
-        logger.warning("intercom inbox error: %s", exc)
-        resp = {"ok": False, "error": str(exc)}
-    try:
-        conn.sendall((json.dumps(resp) + "\n").encode())
-    except OSError:
-        pass
+        if _peer_uid(conn) != os.getuid():
+            raise PermissionError("peer uid does not match server uid")
+        envelope = _read_frame(conn)
+        request = _open(envelope)
+        response = _receive(request, envelope["sender"])
+        response.update(type="receipt", request_id=request.get("request_id", ""))
+        _send_frame(conn, _seal(response, envelope["destination"], envelope["sender"]))
+    except Exception as exception:
+        logger.warning("intercom inbox error: %s", exception)
     finally:
         conn.close()
 
 
-def start(name: str = "", session_id: str = "") -> None:
-    """Start the inbox for this process. Idempotent."""
-    with _lock:
-        if _state.get("running"):
-            return
-
-    reg = _registry_dir()
-    reg.mkdir(parents=True, exist_ok=True)
-    sid = session_id or f"{os.getpid():d}-{int(time.time())}"
-    sock_path = str(reg / f"{sid}.sock")
-    try:
-        os.unlink(sock_path)
-    except OSError:
-        pass
-
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(sock_path)
-    os.chmod(sock_path, 0o600)
-    srv.listen(8)
-
-    meta = {
-        "name": name or _default_name(),
-        "pid": os.getpid(),
-        "cwd": str(Path.cwd()),
-        "session_id": sid,
-        "socket": sock_path,
-        "started_at": time.time(),
-    }
-    (reg / f"{sid}.json").write_text(json.dumps(meta))
-
-    stop_evt = threading.Event()
-
-    def _loop():
-        srv.settimeout(1.0)
-        while not stop_evt.is_set():
-            try:
-                conn, _ = srv.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            threading.Thread(target=_serve, args=(conn,), daemon=True).start()
-
-    t = threading.Thread(target=_loop, name="intercom-inbox", daemon=True)
-    t.start()
-
-    def _cleanup(*_a):
-        stop_evt.set()
-        try:
-            srv.close()
-        except OSError:
-            pass
-        for p in (sock_path, str(reg / f"{sid}.json")):
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
-
-    atexit.register(_cleanup)
-    # NOTE: no custom signal handlers here — the host CLI owns SIGINT/SIGTERM
-    # semantics; atexit covers our cleanup on normal and signal-driven exits.
-
-    with _lock:
-        _state.update(running=True, cleanup=_cleanup, meta=meta, thread=t)
-    recovered = _spool_drain(session_id=sid)
-    with _lock:
-        if recovered:
-            _state["pending_for_self"] = (
-                _state.get("pending_for_self", []) + recovered
-            )[-_PENDING_CAP * 2:]
-
-
 def stop() -> None:
     with _lock:
-        fn = _state.get("cleanup")
-        _state["running"] = False
-    if fn:
-        fn()
+        for waiter in _state.pop("waiters", {}).values():
+            waiter["evt"].set()
+        _sending.clear()
+        _rate.clear()
+        _dedupe.clear()
+        _nonces.clear()
 
 
 def self_meta() -> dict:
-    with _lock:
-        return dict(_state.get("meta") or {})
+    from . import desktop
+
+    if desktop._context is not None:
+        return desktop.self_meta()
+    return {}
 
 
-def _spool_file(session_id: str = "") -> Path:
-    """Owner-only on-disk spill for parked messages scoped to one endpoint id."""
-    sid = session_id or self_meta().get("session_id") or str(os.getpid())
-    return _base_dir() / "pending" / f"{sid}.jsonl"
+def _prepare_directories() -> None:
+    for directory in (_base_dir(), _registry_dir()):
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if directory.is_symlink() or directory.stat().st_uid != os.getuid():
+            raise PermissionError("unsafe intercom directory")
+        os.chmod(directory, 0o700)
+    _initialize_key()
 
 
-def _spool_append(text: str) -> None:
+def _initialize_key() -> None:
+    path = _base_dir() / "key"
     try:
-        f = _spool_file()
-        f.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        os.chmod(f, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"text": text, "ts": time.time()}) + "\n")
-    except Exception:
-        pass
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        descriptor = None
+    if descriptor is not None:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(os.urandom(32))
+            stream.flush()
+            os.fsync(stream.fileno())
+    for _ in range(20):
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+                raise PermissionError("intercom key must be owner-only and owned by current uid")
+            key = stream.read(33)
+        if len(key) == 32:
+            with _lock:
+                _state["key"] = key
+            return
+        time.sleep(0.01)
+    raise ValueError("intercom key must contain exactly 32 bytes")
 
 
-def _spool_drain(session_id: str = "") -> list[str]:
-    """Load and remove spilled messages (called at inbox start)."""
+def _write_registry(path: Path, metadata: dict) -> None:
+    if path.parent.resolve() != _registry_dir().resolve():
+        raise ValueError("registry path escapes registry")
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
-        f = _spool_file(session_id)
-        if not f.exists():
-            return []
-        out = []
-        for line in f.read_text(encoding="utf-8").splitlines():
-            try:
-                out.append(str(json.loads(line)["text"]))
-            except Exception:
-                continue
-        f.unlink(missing_ok=True)
-        return out
-    except Exception:
-        return []
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(metadata, stream, ensure_ascii=False)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
-def take_pending() -> list[str]:
-    """Pop messages parked while idle (drained at next turn)."""
+def _drop_peer(metadata: dict) -> None:
+    identifier = str(metadata.get("session_id", ""))
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,80}", identifier):
+        path = _registry_dir() / f"{identifier}.json"
+        try:
+            if json.loads(path.read_text()).get("socket") == metadata.get("socket"):
+                path.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            return
+
+
+def _prune_windows(now: float) -> None:
+    for peer in list(_rate):
+        values = [timestamp for timestamp in _rate[peer] if now - timestamp < _RATE_WINDOW_S]
+        if values:
+            _rate[peer] = values
+        else:
+            del _rate[peer]
+    for peer in list(_dedupe):
+        values = [(digest, timestamp) for digest, timestamp in _dedupe[peer] if now - timestamp < _DEDUPE_WINDOW_S]
+        if values:
+            _dedupe[peer] = values
+        else:
+            del _dedupe[peer]
+
+
+def _associated_data(envelope: dict) -> bytes:
+    return json.dumps({field: envelope[field] for field in (
+        "version", "sender", "destination", "type", "request_id", "timestamp")},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def _seal(payload: dict, sender: str, destination: str) -> dict:
+    envelope = {"version": 1, "sender": sender, "destination": destination,
+                "type": payload["type"], "request_id": payload.get("request_id", ""),
+                "timestamp": time.time()}
+    nonce = os.urandom(12)
+    plaintext = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    ciphertext = AESGCM(_state["key"]).encrypt(nonce, plaintext, _associated_data(envelope))
+    return {**envelope, "nonce": nonce.hex(), "ciphertext": ciphertext.hex()}
+
+
+def _open(envelope: dict, destination: str | None = None) -> dict:
+    if envelope["version"] != 1:
+        raise ValueError("unsupported protocol version")
+    timestamp = envelope["timestamp"]
+    now = time.time()
+    if not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp) or abs(now - timestamp) > 120:
+        raise ValueError("envelope timestamp outside allowed window")
+    if not all(isinstance(envelope[field], str) and 0 < len(envelope[field]) <= 1024
+               for field in ("sender", "destination", "type")):
+        raise ValueError("invalid envelope identity")
+    request_id = envelope["request_id"]
+    if not isinstance(request_id, str) or (request_id and not re.fullmatch(r"[0-9a-f]{32}", request_id)):
+        raise ValueError("invalid request id")
+    if envelope["type"] in ("ask", "reply") and not request_id:
+        raise ValueError("missing request id")
+    nonce = bytes.fromhex(envelope["nonce"])
+    if len(nonce) != 12:
+        raise ValueError("invalid nonce")
+    plaintext = AESGCM(_state["key"]).decrypt(nonce, bytes.fromhex(envelope["ciphertext"]), _associated_data(envelope))
+    payload = json.loads(plaintext)
+    if payload["type"] != envelope["type"] or payload.get("request_id", "") != request_id:
+        raise ValueError("envelope metadata mismatch")
+    if destination is None:
+        from . import desktop
+
+        metadata = list(desktop._metadata.values())
+        matching = [peer for peer in metadata if envelope["destination"] in (
+            peer.get("session_id"), peer.get("session_key"))]
+        if not matching or payload.get("session_key", "") != matching[0].get("session_key", ""):
+            raise ValueError("wrong destination")
+    elif envelope["destination"] != destination:
+        raise ValueError("wrong destination")
     with _lock:
-        pend = _state.pop("pending_for_self", [])
-    return pend
+        while _nonces and next(iter(_nonces.values())) < now:
+            _nonces.popitem(last=False)
+        if nonce in _nonces:
+            raise ValueError("replayed nonce")
+        if len(_nonces) >= _NONCE_CAP:
+            raise ValueError("nonce cache full")
+        _nonces[nonce] = now + 240
+    return payload
 
 
-def is_running() -> bool:
-    with _lock:
-        return bool(_state.get("running"))
+def _read_exact(connection: socket.socket, length: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < length:
+        chunk = connection.recv(length - len(chunks))
+        if not chunk:
+            raise EOFError("incomplete frame")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def _read_frame(connection: socket.socket) -> dict:
+    length = struct.unpack("!I", _read_exact(connection, 4))[0]
+    if length > _MAX_WIRE_BYTES or length == 0:
+        raise ValueError("invalid wire size")
+    return json.loads(_read_exact(connection, length))
+
+
+def _send_frame(connection: socket.socket, envelope: dict) -> None:
+    data = json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode()
+    if len(data) > _MAX_WIRE_BYTES:
+        raise ValueError("invalid wire size")
+    connection.sendall(struct.pack("!I", len(data)) + data)

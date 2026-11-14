@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import os
 import sys
 import threading
 import unittest
@@ -36,10 +35,11 @@ class ProtocolTests(unittest.TestCase):
     def setUp(self):
         import tempfile
 
-        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name) / ".hermes"
         self.home.mkdir()
         self.plugin = load_plugin(self.home)
+        self.plugin.inbox._prepare_directories()
 
     def tearDown(self):
         self.plugin.inbox.stop()
@@ -61,7 +61,6 @@ class ProtocolTests(unittest.TestCase):
                 from_cwd=from_cwd,
                 payload_extra=payload_extra,
             )
-            request_id = payload_extra["request_id"]
             self.plugin.inbox.resolve_ask(
                 payload_extra["request_id"],
                 "peer",
@@ -73,7 +72,7 @@ class ProtocolTests(unittest.TestCase):
             mock.patch.object(
                 self.plugin.inbox,
                 "resolve_target",
-                return_value={"ok": True, "name": "peer", "meta": {}},
+                return_value={"ok": True, "name": "peer", "meta": {"session_id": "peer"}},
             ),
             mock.patch.object(self.plugin.inbox, "send_to", fake_send_to),
         ):
@@ -104,7 +103,7 @@ class ProtocolTests(unittest.TestCase):
             mock.patch.object(
                 self.plugin.inbox,
                 "resolve_target",
-                return_value={"ok": True, "name": "peer", "meta": {}},
+                return_value={"ok": True, "name": "peer", "meta": {"session_id": "peer"}},
             ),
             mock.patch.object(self.plugin.inbox, "send_to", fake_send_to),
         ):
@@ -133,7 +132,7 @@ class ProtocolTests(unittest.TestCase):
                 self.plugin.inbox,
                 "_load_peers",
                 return_value={
-                    "research-session-123": {"pid": 99999, "socket": "/tmp/peer.sock"}
+                    "research-session-123": {"name": "research-session-123", "session_id": "research-session-123", "pid": 99999, "socket": "/tmp/peer.sock"}
                 },
             ),
             mock.patch.object(self.plugin.inbox, "_exchange", fake_exchange),
@@ -147,8 +146,8 @@ class ProtocolTests(unittest.TestCase):
             self.plugin.inbox,
             "_load_peers",
             return_value={
-                "research": {"pid": 1},
-                "research-long": {"pid": 2},
+                "research": {"name": "research", "pid": 1},
+                "research-long": {"name": "research-long", "pid": 2},
             },
         ):
             result = self.plugin.inbox.resolve_target("research")
@@ -173,7 +172,7 @@ class ProtocolTests(unittest.TestCase):
             mock.patch.object(
                 self.plugin.inbox,
                 "resolve_target",
-                return_value={"ok": True, "name": "research-full", "meta": {}},
+                return_value={"ok": True, "name": "research-full", "meta": {"session_id": "research-full"}},
             ),
             mock.patch.object(self.plugin.inbox, "send_to", fake_send_to),
         ):
@@ -198,7 +197,7 @@ class ProtocolTests(unittest.TestCase):
             mock.patch.object(
                 self.plugin.inbox,
                 "resolve_target",
-                return_value={"ok": True, "name": "peer[name]", "meta": {}},
+                return_value={"ok": True, "name": "peer[name]", "meta": {"session_id": "peername"}},
             ),
             mock.patch.object(self.plugin.inbox, "send_to", fake_send_to),
         ):
@@ -207,7 +206,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(result["reply"], "pong")
 
     def test_reply_only_resolves_waiter_for_expected_peer(self):
-        request_id = "request-123"
+        request_id = "0123456789abcdef0123456789abcdef"
         waiter = threading.Event()
         self.plugin.inbox._state["waiters"] = {
             request_id: {"evt": waiter, "reply": None, "expected_peer": "expected"}
@@ -254,7 +253,7 @@ class ProtocolTests(unittest.TestCase):
                     {
                         "action": "reply",
                         "to": "sender",
-                        "request_id": "request-123",
+                        "request_id": "0123456789abcdef0123456789abcdef",
                         "message": "pong",
                     }
                 )
@@ -265,7 +264,7 @@ class ProtocolTests(unittest.TestCase):
             captured,
             {
                 "target": "sender",
-                "request_id": "request-123",
+                "request_id": "0123456789abcdef0123456789abcdef",
                 "message": "pong",
                 "from_name": "receiver",
                 "from_cwd": "/tmp",
@@ -275,35 +274,27 @@ class ProtocolTests(unittest.TestCase):
     def test_ask_envelope_tells_receiver_to_use_reply_action(self):
         delivered = {}
 
-        def capture_delivery(text):
+        def capture_delivery(session_key, text):
             delivered["text"] = text
             return "submitted_as_turn"
 
         server, client = self.plugin.inbox.socket.socketpair()
-        with mock.patch.object(self.plugin.inbox, "_deliver_local", capture_delivery):
+        from hermes_intercom_test import desktop
+
+        with mock.patch.object(desktop, "deliver", capture_delivery):
             worker = threading.Thread(target=self.plugin.inbox._serve, args=(server,))
             worker.start()
-            client.sendall(
-                (
-                    json.dumps(
-                        {
-                            "type": "ask",
-                            "from_name": "sender",
-                            "from_cwd": "/tmp",
-                            "message": "ping",
-                            "request_id": "request-123",
-                        }
-                    )
-                    + "\n"
-                ).encode()
-            )
-            response = json.loads(client.makefile().readline())
+            desktop._metadata = {"receiver": {"session_id": "receiver"}}
+            self.plugin.inbox._send_frame(client, self.plugin.inbox._seal({
+                "type": "ask", "from_name": "sender", "from_cwd": "/tmp", "message": "ping",
+                "request_id": "0123456789abcdef0123456789abcdef"}, "sender", "receiver"))
+            response = self.plugin.inbox._open(self.plugin.inbox._read_frame(client), destination="sender")
             worker.join(timeout=2)
             client.close()
 
         self.assertTrue(response["ok"])
         self.assertIn('intercom(action="reply"', delivered["text"])
-        self.assertIn('request_id="request-123"', delivered["text"])
+        self.assertIn('request_id="0123456789abcdef0123456789abcdef"', delivered["text"])
         self.assertIn('to="sender"', delivered["text"])
 
     def test_rejects_peer_with_different_uid(self):
@@ -315,90 +306,50 @@ class ProtocolTests(unittest.TestCase):
         ):
             worker = threading.Thread(target=self.plugin.inbox._serve, args=(server,))
             worker.start()
-            try:
-                client.sendall(
-                    (json.dumps({"type": "send", "message": "ping"}) + "\n").encode()
-                )
-            except BrokenPipeError:
-                pass
-            response = json.loads(client.makefile().readline())
+            response = client.recv(1)
             worker.join(timeout=2)
             client.close()
 
-        self.assertFalse(response["ok"])
-        self.assertIn("uid", response["error"])
+        self.assertEqual(response, b"")
 
-    def test_registry_identity_ignores_inherited_session_id(self):
-        with mock.patch.dict(
-            self.plugin.inbox.os.environ,
-            {"HERMES_SESSION_ID": "stale-parent-session"},
-        ):
-            self.plugin.inbox.start(name="lab")
-
-        self.assertNotEqual(
-            self.plugin.inbox.self_meta()["session_id"],
-            "stale-parent-session",
+    def test_key_and_registry_permissions_are_owner_only(self):
+        self.plugin.inbox._write_registry(
+            self.home / "intercom" / "sessions" / "endpoint-123.json",
+            {"session_id": "endpoint-123"},
         )
-
-    def test_spool_survives_inbox_restart_for_explicit_endpoint(self):
-        self.plugin.inbox.start(name="lab", session_id="endpoint-123")
-        self.plugin.inbox._spool_append("survives restart")
-        self.plugin.inbox.stop()
-        self.plugin.inbox.start(name="lab", session_id="endpoint-123")
-
-        self.assertEqual(self.plugin.inbox.take_pending(), ["survives restart"])
-
-    def test_spool_file_permissions_are_owner_only(self):
-        self.plugin.inbox.start(name="lab", session_id="endpoint-123")
-        with mock.patch("os.open", wraps=os.open) as open_spy:
-            self.plugin.inbox._spool_append("private message")
-
-        spool = self.home / "intercom" / "pending" / "endpoint-123.jsonl"
-        self.assertEqual(spool.stat().st_mode & 0o777, 0o600)
-        self.assertTrue(any(call.args[-1] == 0o600 for call in open_spy.call_args_list))
-
-    def test_spool_drain_uses_new_endpoint_not_stale_module_state(self):
-        stale = self.home / "intercom" / "pending" / "stale.jsonl"
-        stale.parent.mkdir(parents=True)
-        stale.write_text(json.dumps({"text": "wrong", "ts": 1}) + "\n")
-        target = stale.parent / "target.jsonl"
-        target.write_text(json.dumps({"text": "right", "ts": 2}) + "\n")
-        self.plugin.inbox._state["meta"] = {"session_id": "stale"}
-
-        self.plugin.inbox.start(name="lab", session_id="target")
-
-        self.assertEqual(self.plugin.inbox.take_pending(), ["right"])
-        self.assertTrue(stale.exists())
+        self.assertEqual((self.home / "intercom" / "key").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.home / "intercom" / "sessions" / "endpoint-123.json").stat().st_mode & 0o777, 0o600)
+        self.assertFalse((self.home / "intercom" / "pending").exists())
 
     def test_same_uid_socket_round_trip(self):
         delivered = {}
 
-        def capture_delivery(text):
+        def capture_delivery(session_key, text):
             delivered["text"] = text
             return "submitted_as_turn"
 
-        self.plugin.inbox.start(name="receiver", session_id="receiver-session")
-        socket_path = self.plugin.inbox.self_meta()["socket"]
-        with mock.patch.object(self.plugin.inbox, "_deliver_local", capture_delivery):
+        from hermes_intercom_test import desktop
+
+        desktop._metadata = {"receiver": {"session_id": "receiver-session"}}
+        socket_path = str(Path(self.tmp.name) / "peer.sock")
+        listener = self.plugin.inbox.socket.socket(self.plugin.inbox.socket.AF_UNIX, self.plugin.inbox.socket.SOCK_STREAM)
+        listener.bind(socket_path)
+        listener.listen(1)
+        with mock.patch.object(desktop, "deliver", capture_delivery):
             with self.plugin.inbox.socket.socket(
                 self.plugin.inbox.socket.AF_UNIX,
                 self.plugin.inbox.socket.SOCK_STREAM,
             ) as client:
                 client.connect(socket_path)
-                client.sendall(
-                    (
-                        json.dumps(
-                            {
-                                "type": "send",
-                                "from_name": "sender",
-                                "from_cwd": "/tmp",
-                                "message": "ping",
-                            }
-                        )
-                        + "\n"
-                    ).encode()
-                )
-                response = json.loads(client.makefile().readline())
+                connection, _ = listener.accept()
+                worker = threading.Thread(target=self.plugin.inbox._serve, args=(connection,))
+                worker.start()
+                self.plugin.inbox._send_frame(client, self.plugin.inbox._seal({
+                    "type": "send", "from_name": "sender", "from_cwd": "/tmp", "message": "ping"},
+                    "sender", "receiver-session"))
+                response = self.plugin.inbox._open(self.plugin.inbox._read_frame(client), destination="sender")
+                worker.join(timeout=2)
+        listener.close()
 
         self.assertTrue(response["ok"])
         self.assertEqual(response["status"], "submitted_as_turn")
@@ -415,15 +366,15 @@ class ProtocolTests(unittest.TestCase):
             mock.patch.object(
                 self.plugin.inbox,
                 "_load_peers",
-                return_value={"peer": {"pid": 99999, "socket": "/tmp/peer.sock"}},
+                return_value={"peer": {"name": "peer", "pid": 99999, "socket": "/tmp/peer.sock"}},
             ),
             mock.patch.object(self.plugin.inbox, "_exchange", fake_exchange, create=True),
         ):
-            first = self.plugin.inbox.reply_to("peer", "request-1", "same answer")
-            second = self.plugin.inbox.reply_to("peer", "request-2", "same answer")
+            first = self.plugin.inbox.reply_to("peer", "11111111111111111111111111111111", "same answer")
+            second = self.plugin.inbox.reply_to("peer", "22222222222222222222222222222222", "same answer")
 
         self.assertTrue(first["ok"] and second["ok"])
-        self.assertEqual([item["request_id"] for item in captured], ["request-1", "request-2"])
+        self.assertEqual([item["request_id"] for item in captured], ["11111111111111111111111111111111", "22222222222222222222222222222222"])
 
     def test_send_preserves_exchange_error(self):
         with (
