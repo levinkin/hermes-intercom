@@ -25,14 +25,42 @@ def live_sessions():
 
     if _context is None or _socket is None:
         return {}
-    host = _context._manager._gateway_message_injector
-    if host is None:
-        return {}
-    authority = authority_for_home(host[0], _context._manager.home_path)
-    if authority is None:
-        return {}
+    manager = _context._manager
     sessions = {}
-    for session_id, session in authority.sessions.copy().items():
+    if manager.has_tui_message_injector:
+        from tui_gateway import server
+
+        with server._sessions_lock:
+            tui_sessions = list(server._sessions.values())
+        for session in tui_sessions:
+            if session.get("lazy") or session.get("_closing") or session.get("_finalized"):
+                continue
+            if server._session_source(session) not in {"cli", "tui", "desktop", "gui", "local"}:
+                continue
+            profile_home = session.get("profile_home")
+            if profile_home and Path(profile_home).resolve() != Path(manager.home_path).resolve():
+                continue
+            live = server._live_session_agent_db(session)
+            if live is None:
+                continue
+            agent, session_key, database = live
+            row = database.get_session_list_row(getattr(agent, "session_id", None) or session_key) or {}
+            if row.get("ended_at") is not None:
+                continue
+            sessions[session_key] = {
+                "name": inbox._sanitize_name(row.get("title") or session_key[-12:]),
+                "pid": os.getpid(),
+                "cwd": session.get("cwd") or "?",
+                "session_id": uuid.uuid5(uuid.NAMESPACE_URL, session_key).hex,
+                "session_key": session_key,
+                "socket": _socket.getsockname(),
+                "turn_active": bool(session.get("running")),
+                "surface": "desktop",
+            }
+    host = manager._gateway_message_injector
+    authority = authority_for_home(host[0], manager.home_path) if host is not None else None
+    hosted = authority.sessions.copy().items() if authority is not None else ()
+    for session_id, session in hosted:
         if getattr(session.source.platform, "value", "") != "local":
             continue
         row = authority.db.get_session_list_row(session_id) or {}
