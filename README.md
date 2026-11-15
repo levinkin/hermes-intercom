@@ -1,101 +1,71 @@
 # hermes-intercom
 
-Local cross-session messaging for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — let your interactive CLI/TUI sessions discover each other and exchange messages automatically, Claude Code style.
+lets your hermes chats on one machine find each other and message each other. works across desktop app chats, `hermes chat` and the tui.
 
-Based on the design proposed in [NousResearch/hermes-agent#81885](https://github.com/NousResearch/hermes-agent/issues/81885) ("Local cross-session messaging (intercom) — discovery + peer inbox for interactive sessions"). Credit for the architecture — broker-less registry, single multiplexed tool, steer-based delivery — goes to that issue's proposal; this repo is a working implementation with field-tested refinements.
+based on the proposal in [NousResearch/hermes-agent#81885](https://github.com/NousResearch/hermes-agent/issues/81885) and forked from [majordave/hermes-intercom](https://github.com/majordave/hermes-intercom), which covered cli/tui only. this version runs inside the gateway and the desktop app's backend, so desktop chats work too.
 
-## What it does
-
-Each Hermes session running the plugin:
-
-1. **Registers itself** — writes `~/.hermes/intercom/sessions/<session_id>.json` (name, pid, cwd) and binds a `0600` Unix socket. Dead sessions are swept automatically.
-2. **Discovers peers** — the agent gets an `intercom` tool: `action="list"` returns live sessions with name, cwd and busy state.
-3. **Messages them** — `action="send"` delivers plain text to a named peer; `action="ask"` sends and blocks until the peer replies (or timeout), with the reply routed back automatically.
-
-Every send returns a receipt: `delivered` (receiver starts a turn or was steered mid-turn) / `held` (accepted, surfaces at its next boundary) / `refused`. Messages parked while the receiver has no reachable agent spill to an owner-only file for that endpoint's lifetime.
-
-On the receiving side, arrival is **immediate and automatic**:
-
-- If the receiving session is **idle**, the message is submitted into its input queue — the session **starts a turn by itself**, no user action needed.
-- If it's **mid-turn**, the message is steered into the running turn (drained between tool calls) or parked for its next turn via the `pre_llm_call` plugin hook.
-- The message renders once, as part of that turn, in a compact frame:
-
-```
-📡 hermes@<session-name> says:
-<message body>
-```
-
-- Echo suppression strips any intercom headers the sending agent quoted back, so the receiver never sees a duplicated header.
-- The delivered text is inert: it cannot approve actions or run slash commands.
-
-## Demo
-
-```
-📡 hermes@researcher says:
-The schema migration just landed on main; rebase your branch before continuing with the payments work.
-```
-
-Validated end-to-end (2026-08): CLI ↔ TUI round trip where the receiver auto-started a turn, replied using the `intercom` tool on its own initiative, and the reply arrived in the original sender's next turn. Mid-turn steering also verified live.
-
-## Install
+## install
 
 ```bash
-git clone https://github.com/majordave/hermes-intercom ~/.hermes/plugins/intercom
-hermes plugins enable intercom
+hermes plugins install levinkin/hermes-intercom
+hermes config set plugins.entries.intercom.allow_gateway_injection true
+hermes gateway restart
 ```
 
-Then just run two `hermes chat` sessions. Ask either one:
+restart the desktop app's backend too. it keeps running after you quit the app, so stop it or reboot.
 
-> use intercom to list the live sessions and say hi to the other one
+new chats get the tool. ask one:
 
-## Configuration
+> use intercom to list sessions, then ask the other chat what 2+2 is
 
-In `~/.hermes/config.yaml`:
+## the tool
 
-```yaml
-plugins:
-  enabled:
-    - intercom
-  entries:
-    intercom:
-      settings:
-        inbound: always   # always | never (never disables the inbox)
+one tool, `intercom`, with an `action`:
+
+| action | params | what it does |
+|---|---|---|
+| `list` | none | live chats (name, cwd, busy/idle) |
+| `send` | `to` (string), `message` (string, max 8000 chars) | delivers a message, returns `delivered` or `refused` |
+| `ask` | `to`, `message`, `timeout` (integer, default `600`, max `3600`) | sends and waits for the reply |
+| `reply` | `request_id` (string), `message` | answers an `ask` |
+
+names are the chat titles. two chats with the same title get an id suffix.
+
+an idle chat starts a turn when a message comes in. a busy one gets it at its next turn. messages show up as:
+
+```
+📡 hermes@<chat name> says:
+<message>
 ```
 
-## Safety
+messages are inert text. they can't approve actions or run slash commands.
 
-- Socket is `0600`, and the receiver verifies the peer UID — no TCP listener, ever
-- Inbound messages are inert text; the frame identifies the sending session so the model never mistakes it for user instructions
-- Per-peer rate limit (6/min), duplicate suppression (120 s window), pending queue cap with owner-only disk spill
-- Sessions publish their busy/idle state (`turn_active`) to the registry so senders can pick idle peers
+## settings
 
-## Implementation notes
+| key | type | accepts | default |
+|---|---|---|---|
+| `plugins.entries.intercom.allow_gateway_injection` | bool | `true`/`false` | `false` (needs `true`) |
+| `plugins.entries.intercom.settings.inbound` | string | `always`, `never` | `always` (`never` = this profile can send but not receive) |
 
-Findings from building this against the real Hermes codebase are in [`docs/findings.md`](docs/findings.md) — most notably that `HermesCLI` is a local of `main()`, so the live instance must be found via GC, and that `HermesCLI._pending_input` is the wake channel that makes idle sessions start turns automatically.
+## security
 
-## Roadmap
+- only local chats (desktop/cli/tui) can use it. discord, telegram and other messaging sessions get refused.
+- chats in the same process talk in memory. nothing goes over a socket.
+- between processes (gateway and desktop backend) messages go over a `0600` unix socket and the receiver checks the peer's uid.
+- every message between processes is sealed with aes-256-gcm. sender, recipient, type, request id and timestamp are bound in, so a message can't be moved to another chat or replayed (120 s window, nonces tracked).
+- the key lives at `~/.hermes/intercom/key` (`0600`). anything running as your user can read it, same as your ssh keys.
+- full queues and dead chats return `refused`, never a fake `delivered`. rate limit is 6/min per sender per chat.
 
-Implemented in v2/v3:
+## tests
 
-- ✅ Blocking `ask`/`reply` (request-response with explicit request IDs and timeout)
-- ✅ Delivery receipts (`delivered` / `held` / `refused`)
-- ✅ Busy/idle state published to the registry and surfaced via `action="list"`
-- ✅ Owner-only inbox spool for parked messages during an endpoint's lifetime
-- ✅ Frame-forgery defenses (legacy tag neutralization + header spoofing broken via zero-width space)
-- ✅ Stable profile-based session naming
-- ✅ Single-render compact frame (`📡 hermes@<session> says:`) — no duplicate banner/turn rendering
-- ✅ Echo-header suppression on send
+```bash
+python tests/test_protocol.py
+python tests/e2e_desktop.py
+python tests/e2e_tui_gateway.py
+```
 
-Still ahead:
+use the gateway's python. the e2e runs start a throwaway gateway and desktop host on spare ports with a stub model (no tokens).
 
-- First-class TUI/desktop peers via the tui_gateway
-- Stable `agent_id` per profile (decoupling identity from pid)
-- Durable mailbox identity for recovery across process restarts
-- Migrate delivery to the official host seam if upstream #70406 merges
-- Windows named pipes
+## license
 
-Cross-machine messaging stays out of scope — that's the A2A platform plugin's lane.
-
-## License
-
-MIT
+mit. original code by majordave, desktop/gateway rewrite by kevin lin.

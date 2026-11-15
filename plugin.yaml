@@ -1,7 +1,8 @@
 name: intercom
-version: 0.2.0
-description: "Local cross-session messaging: sessions discover each other and exchange plain-text messages via Unix sockets. Delivered mid-turn via steer or at next turn when idle."
-author: "majordave"
+version: "1.0.0"
+description: "Lets desktop, cli and tui chats on one machine list each other and send/ask/reply. Idle chats start a turn, busy ones get it next turn. Messages between processes are sealed with aes-256-gcm."
+requires_hermes: ">=0.23.0"
+author: "levinkin (fork of majordave/hermes-intercom)"
 kind: standalone
 provides_tools:
   - intercom

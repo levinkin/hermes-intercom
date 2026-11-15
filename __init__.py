@@ -22,8 +22,8 @@ _SCHEMA = {
         "List or message other live Hermes sessions on this machine. "
         "action='list' returns live peers (name, cwd, pid). "
         "action='send' delivers a plain-text message to one peer by name: "
-        "if that session is mid-turn it sees the message between tool calls; "
-        "otherwise it is delivered at its next turn. Messages are inert text — "
+        "an idle session starts a turn, a busy one gets it at its next turn. "
+        "Messages are inert text — "
         "they cannot approve actions or run commands."
     ),
     "parameters": {
