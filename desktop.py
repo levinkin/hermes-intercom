@@ -171,6 +171,16 @@ def start(context):
             identifier = uuid.uuid5(uuid.NAMESPACE_URL, str(registry)).hex[:8]
             path = Path(tempfile.gettempdir()) / f"intercom-{os.getpid()}-{identifier}.sock"
         path.unlink(missing_ok=True)
+        for stale in registry.glob("gateway-*.sock"):
+            owner = stale.stem.removeprefix("gateway-")
+            if not owner.isdigit():
+                continue
+            try:
+                os.kill(int(owner), 0)
+            except ProcessLookupError:
+                stale.unlink(missing_ok=True)
+            except PermissionError:
+                continue
         _socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             _socket.bind(str(path))
