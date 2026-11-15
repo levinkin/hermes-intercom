@@ -20,64 +20,22 @@ _lifecycle_lock = threading.RLock()
 
 
 def live_sessions():
-    from gateway.session_authorities import authority_for_home
-    from gateway.session_policy import policy_for_source
-
     if _context is None or _socket is None:
         return {}
-    manager = _context._manager
     sessions = {}
-    if manager.has_tui_message_injector:
-        from tui_gateway import server
-
-        with server._sessions_lock:
-            tui_sessions = list(server._sessions.values())
-        for session in tui_sessions:
-            if session.get("lazy") or session.get("_closing") or session.get("_finalized"):
-                continue
-            if server._session_source(session) not in {"cli", "tui", "desktop", "gui", "local"}:
-                continue
-            profile_home = session.get("profile_home")
-            if profile_home and Path(profile_home).resolve() != Path(manager.home_path).resolve():
-                continue
-            live = server._live_session_agent_db(session)
-            if live is None:
-                continue
-            agent, session_key, database = live
-            row = database.get_session_list_row(getattr(agent, "session_id", None) or session_key) or {}
-            if row.get("ended_at") is not None:
-                continue
-            sessions[session_key] = {
-                "name": inbox._sanitize_name(row.get("title") or session_key[-12:]),
-                "pid": os.getpid(),
-                "cwd": session.get("cwd") or "?",
-                "session_id": uuid.uuid5(uuid.NAMESPACE_URL, session_key).hex,
-                "session_key": session_key,
-                "socket": _socket.getsockname(),
-                "turn_active": bool(session.get("running")),
-                "surface": "desktop",
-            }
-    host = manager._gateway_message_injector
-    authority = authority_for_home(host[0], manager.home_path) if host is not None else None
-    hosted = authority.sessions.copy().items() if authority is not None else ()
-    for session_id, session in hosted:
-        if getattr(session.source.platform, "value", "") != "local":
+    for session in _context.live_sessions():
+        session_key = session["session_key"]
+        if session["surface"] not in {"cli", "tui", "desktop", "acp"} or session_key in sessions:
             continue
-        row = authority.db.get_session_list_row(session_id) or {}
-        if row.get("ended_at") is not None:
-            continue
-        policy = policy_for_source(authority.runner, session.source)
-        identifier = uuid.uuid5(uuid.NAMESPACE_URL, session.route).hex
-        name = inbox._sanitize_name(row.get("title") or session_id[-12:])
-        sessions[session.route] = {
-            "name": name,
+        sessions[session_key] = {
+            "name": inbox._sanitize_name(session["title"] or session_key[-12:]),
             "pid": os.getpid(),
-            "cwd": policy.cwd if policy is not None else "?",
-            "session_id": identifier,
-            "session_key": session.route,
+            "cwd": session["cwd"] or "?",
+            "session_id": uuid.uuid5(uuid.NAMESPACE_URL, session_key).hex,
+            "session_key": session_key,
             "socket": _socket.getsockname(),
-            "turn_active": session.task is not None and not session.task.done(),
-            "surface": "desktop",
+            "turn_active": bool(session["busy"]),
+            "surface": session["surface"],
         }
     names = Counter(metadata["name"] for metadata in sessions.values())
     for metadata in sessions.values():
@@ -89,11 +47,11 @@ def live_sessions():
 def refresh(active=None):
     global _metadata
 
-    from gateway.session_context import bound_session_key
+    from gateway.session_context import get_session_env
 
     with _lifecycle_lock:
         sessions = live_sessions()
-        key = bound_session_key()
+        key = get_session_env("HERMES_SESSION_KEY", "")
         if active is not None and key in sessions:
             sessions[key]["turn_active"] = active
         registry = inbox._registry_dir()
@@ -106,10 +64,10 @@ def refresh(active=None):
 
 
 def self_meta():
-    from gateway.session_context import bound_session_key
+    from gateway.session_context import get_session_env
 
     with _lifecycle_lock:
-        return dict(_metadata.get(bound_session_key()) or {})
+        return dict(_metadata.get(get_session_env("HERMES_SESSION_KEY", "")) or {})
 
 
 def deliver(session_key, text):

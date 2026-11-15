@@ -297,6 +297,39 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn('request_id="0123456789abcdef0123456789abcdef"', delivered["text"])
         self.assertIn('to="sender"', delivered["text"])
 
+    def test_live_sessions_maps_context_sessions(self):
+        from hermes_intercom_test import desktop
+
+        context = mock.Mock()
+        context.live_sessions.return_value = [
+            {"session_key": "agent:main:local:alpha", "session_id": "a", "title": "worker",
+             "cwd": "/repo", "surface": "desktop", "busy": True},
+            {"session_key": "agent:main:local:bravo", "session_id": "b", "title": "worker",
+             "cwd": "", "surface": "tui", "busy": False},
+            {"session_key": "agent:main:local:charlie123456", "session_id": "c", "title": "",
+             "cwd": "/repo", "surface": "cli", "busy": False},
+            {"session_key": "agent:main:telegram:dm:1", "session_id": "d", "title": "chat",
+             "cwd": "", "surface": "telegram", "busy": False},
+            {"session_key": "agent:main:local:alpha", "session_id": "e", "title": "duplicate",
+             "cwd": "", "surface": "cli", "busy": False},
+        ]
+        listener = mock.Mock()
+        listener.getsockname.return_value = "/tmp/desktop.sock"
+        with mock.patch.object(desktop, "_context", context), mock.patch.object(desktop, "_socket", listener):
+            sessions = desktop.live_sessions()
+
+        self.assertEqual(set(sessions), {"agent:main:local:alpha", "agent:main:local:bravo", "agent:main:local:charlie123456"})
+        alpha = sessions["agent:main:local:alpha"]
+        bravo = sessions["agent:main:local:bravo"]
+        charlie = sessions["agent:main:local:charlie123456"]
+        self.assertEqual(alpha["name"], "worker-" + alpha["session_id"][:8])
+        self.assertEqual(bravo["name"], "worker-" + bravo["session_id"][:8])
+        self.assertEqual(charlie["name"], "harlie123456")
+        self.assertEqual((alpha["cwd"], bravo["cwd"]), ("/repo", "?"))
+        self.assertEqual((alpha["turn_active"], bravo["turn_active"]), (True, False))
+        self.assertEqual((alpha["surface"], bravo["surface"], charlie["surface"]), ("desktop", "tui", "cli"))
+        self.assertEqual(alpha["socket"], "/tmp/desktop.sock")
+
     def test_rejects_peer_with_different_uid(self):
         server, client = self.plugin.inbox.socket.socketpair()
         with mock.patch.object(
