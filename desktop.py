@@ -19,11 +19,54 @@ _thread = None
 _lifecycle_lock = threading.RLock()
 
 
+def _legacy_live_sessions(context):
+    from gateway.session_authorities import authority_for_home
+    from gateway.session_policy import policy_for_source
+
+    manager = context._manager
+    host = manager._gateway_message_injector
+    authority = authority_for_home(host[0], manager.home_path) if host is not None else None
+    if authority is not None:
+        for session_id, session in authority.sessions.copy().items():
+            if getattr(getattr(session.source, "platform", None), "value", "") != "local":
+                continue
+            policy = policy_for_source(authority.runner, session.source)
+            row = authority.persistence.sessions.list_row(session_id)
+            if policy is None or (row is not None and row.ended_at is not None):
+                continue
+            yield {"session_key": session.route, "title": row.title if row is not None else None, "cwd": policy.cwd,
+                   "surface": policy.platform, "busy": session.task is not None and not session.task.done()}
+    if manager.has_tui_message_injector:
+        from tui_gateway import server
+        from tui_gateway.session_workdir import _session_source
+
+        with server._sessions_lock:
+            tui_sessions = list(server._sessions.values())
+        for session in tui_sessions:
+            if session.get("lazy") or session.get("_closing") or session.get("_finalized"):
+                continue
+            if _session_source(session) not in {"cli", "tui", "desktop", "gui", "local"}:
+                continue
+            profile_home = session.get("profile_home")
+            if profile_home and Path(profile_home).resolve() != Path(manager.home_path).resolve():
+                continue
+            live = server._live_session_agent_db(session)
+            if live is None:
+                continue
+            agent, session_key, database = live
+            row = database.get_session_list_row(getattr(agent, "session_id", None) or session_key) or {}
+            if row.get("ended_at") is not None:
+                continue
+            yield {"session_key": session_key, "title": row.get("title"), "cwd": session.get("cwd"),
+                   "surface": "desktop", "busy": session.get("running")}
+
+
 def live_sessions():
     if _context is None or _socket is None:
         return {}
     sessions = {}
-    for session in _context.live_sessions():
+    discover = getattr(_context, "live_sessions", None)
+    for session in discover() if discover is not None else _legacy_live_sessions(_context):
         session_key = session["session_key"]
         if session["surface"] not in {"cli", "tui", "desktop", "acp"} or session_key in sessions:
             continue
